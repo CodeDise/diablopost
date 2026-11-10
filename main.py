@@ -70,6 +70,23 @@ def main():
         return
     
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # FIX: make query.answer() safe when a handler chain answers twice
+    from plugins.helpers import patch_query_answer
+    patch_query_answer()
+
+    async def on_error(update, context):
+        logger.error("Unhandled error", exc_info=context.error)
+        try:
+            from config import OWNER_ID
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"⚠️ Bot error: {type(context.error).__name__}: {str(context.error)[:300]}"
+            )
+        except Exception:
+            pass
+
+    app.add_error_handler(on_error)
     
     try:
         from plugins import (
