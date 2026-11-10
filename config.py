@@ -4,7 +4,7 @@ PRODUCTION GRADE - DO NOT COMMIT TO GIT
 """
 
 # ==================== BOT TOKEN ====================
-BOT_TOKEN = "8841997682:AAHGnYpp6MG0iD321lHOs4ueQMOjIofZ9YI"
+BOT_TOKEN = "8773512678:AAECYUGLDYWWpDLwZ9FI9ZcsbmFSr0iuRLY"
 
 # ==================== MONGODB ====================
 MONGO_URI = "mongodb+srv://otxstudioofficial1_db_user:MEAH3IXpZFAxHHew@cluster0.n23pbwq.mongodb.net/?appName=Cluster0"
