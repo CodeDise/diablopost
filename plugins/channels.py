@@ -10,7 +10,8 @@ from plugins.helpers import (
     get_session,
     clean_session,
     channel_keyboard,
-    show_menu_safe
+    show_menu_safe,
+    build_setup_buttons
 )
 from db import channels, formats, posts
 import logging
@@ -178,7 +179,8 @@ async def receive_channel_forward(update, context):
         channels.insert_one({
             "_id": channel_id,
             "title": channel_title,
-            "has_format": False
+            "has_format": False,
+            "setup_done": False
         })
         
         clean_session(user_id)
@@ -189,17 +191,9 @@ async def receive_channel_forward(update, context):
             f"*ID:* `{channel_id}`\n"
             f"*Method:* Forwarded Message 🆕\n\n"
             f"**Next Step:**\n"
-            f"Set format for this channel to start posting.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "📸 Set Format Now",
-                    callback_data=f"setfmt:{channel_id}:0"
-                )],
-                [InlineKeyboardButton(
-                    "🔙 Back to Settings",
-                    callback_data="menu:settings"
-                )]
-            ]),
+            f"Set *Format* and *Update Format*.\n"
+            f"The channel becomes active only after both are set.",
+            reply_markup=build_setup_buttons(channel_id),
             parse_mode="Markdown"
         )
         
@@ -283,7 +277,8 @@ async def receive_channel_id(update, context):
         channels.insert_one({
             "_id": channel_id,
             "title": channel_title,
-            "has_format": False
+            "has_format": False,
+            "setup_done": False
         })
         
         clean_session(user_id)
@@ -294,17 +289,9 @@ async def receive_channel_id(update, context):
             f"*ID:* `{channel_id}`\n"
             f"*Method:* Channel ID\n\n"
             f"**Next Step:**\n"
-            f"Set format for this channel to start posting.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "📸 Set Format Now",
-                    callback_data=f"setfmt:{channel_id}:0"
-                )],
-                [InlineKeyboardButton(
-                    "🔙 Back to Settings",
-                    callback_data="menu:settings"
-                )]
-            ]),
+            f"Set *Format* and *Update Format*.\n"
+            f"The channel becomes active only after both are set.",
+            reply_markup=build_setup_buttons(channel_id),
             parse_mode="Markdown"
         )
         

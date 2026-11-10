@@ -3,13 +3,52 @@ Helper Functions - FIXED
 Added dual button routing to message router
 """
 
-from db import sessions, admins, channels, menu_messages
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity
+from db import sessions, admins, channels, menu_messages, formats, update_settings
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, CallbackQuery
 from telegram.error import BadRequest
 from config import PAGE_SIZE, CHANNELS_PER_ROW, OWNER_ID
+from collections import OrderedDict
+import difflib
 import logging
+import os
+import re
+import unicodedata
 
 logger = logging.getLogger(__name__)
+
+# ==================== SAFE query.answer() (FIX: double-answer error) ====================
+# Many handlers call query.answer() and then call another function that
+# calls query.answer() AGAIN (e.g. toggle/delete update channel -> show_menu).
+# Telegram rejects the 2nd answer ("query is too old / invalid") and the
+# handler crashes before refreshing the menu. This patch makes answer()
+# idempotent for the same callback query.
+_ANSWERED = OrderedDict()
+_orig_answer = CallbackQuery.answer
+
+async def _safe_answer(self, *args, **kwargs):
+    qid = self.id
+    if qid in _ANSWERED:
+        return True
+    _ANSWERED[qid] = True
+    while len(_ANSWERED) > 500:
+        _ANSWERED.popitem(last=False)
+    try:
+        return await _orig_answer(self, *args, **kwargs)
+    except BadRequest as e:
+        logger.debug(f"query.answer ignored: {e}")
+        return False
+
+def patch_query_answer():
+    """Call once at startup (main.py)."""
+    if CallbackQuery.answer is not _safe_answer:
+        CallbackQuery.answer = _safe_answer
+
+# ==================== MARKDOWN ESCAPE ====================
+def escape_md(text):
+    """Escape legacy-Markdown special chars so titles/templates never break parse_mode."""
+    if text is None:
+        return ""
+    return re.sub(r'([_*`\[])', lambda m: '\\' + m.group(1), str(text))
 
 # ==================== AUTH ====================
 def is_owner(uid):
@@ -146,67 +185,211 @@ async def send_main_menu(chat_id, context, notification_text=None):
         return None
 
 # ==================== CAPTION ENTITIES FIX ====================
+def _u16(text):
+    """Length of text in UTF-16 code units (Telegram entity offsets use this)."""
+    return len(text.encode("utf-16-le")) // 2
+
+def _entity_to_dict(entity):
+    if isinstance(entity, MessageEntity):
+        d = {"type": entity.type, "offset": entity.offset, "length": entity.length}
+        if entity.url:
+            d["url"] = entity.url
+        if entity.user:
+            d["user"] = entity.user.id if hasattr(entity.user, "id") else entity.user
+        if entity.language:
+            d["language"] = entity.language
+        if entity.custom_emoji_id:
+            d["custom_emoji_id"] = entity.custom_emoji_id
+        return d
+    return dict(entity)
+
 def adjust_caption_entities(caption, entities, placeholder="{episode}", replacement=""):
-    """Adjust caption entity offsets when replacing placeholder"""
-    
-    if not entities:
-        return caption.replace(placeholder, replacement), None
-    
-    placeholder_pos = caption.find(placeholder)
-    if placeholder_pos == -1:
-        return caption, entities
-    
-    placeholder_len = len(placeholder)
-    replacement_len = len(replacement)
-    offset_diff = replacement_len - placeholder_len
-    
-    adjusted_entities = []
-    
-    for entity in entities:
-        if isinstance(entity, MessageEntity):
-            entity_dict = {
-                "type": entity.type,
-                "offset": entity.offset,
-                "length": entity.length
-            }
-            if entity.url:
-                entity_dict["url"] = entity.url
-            if entity.user:
-                entity_dict["user"] = entity.user
-            if entity.language:
-                entity_dict["language"] = entity.language
-            if entity.custom_emoji_id:
-                entity_dict["custom_emoji_id"] = entity.custom_emoji_id
-        else:
-            entity_dict = dict(entity)
-        
-        entity_start = entity_dict["offset"]
-        entity_end = entity_start + entity_dict["length"]
-        placeholder_end = placeholder_pos + placeholder_len
-        
-        if entity_end <= placeholder_pos:
-            adjusted_entities.append(entity_dict)
-        elif entity_start >= placeholder_end:
-            entity_dict["offset"] += offset_diff
-            adjusted_entities.append(entity_dict)
-        else:
-            if entity_start <= placeholder_pos and entity_end >= placeholder_end:
-                entity_dict["length"] += offset_diff
-                adjusted_entities.append(entity_dict)
-            elif entity_start >= placeholder_pos and entity_start < placeholder_end:
-                entity_dict["offset"] = placeholder_pos
-                if entity_end > placeholder_end:
-                    entity_dict["length"] = (entity_end - placeholder_end) + replacement_len
-                else:
-                    entity_dict["length"] = replacement_len
-                adjusted_entities.append(entity_dict)
-            elif entity_end > placeholder_pos and entity_end <= placeholder_end:
-                entity_dict["length"] = placeholder_pos - entity_start
-                if entity_dict["length"] > 0:
-                    adjusted_entities.append(entity_dict)
-    
+    """
+    Replace placeholder in caption and shift entity offsets correctly.
+    FIX: works in UTF-16 units (emoji before {episode} no longer break
+    formatting) and handles the placeholder appearing more than once.
+    """
+    if not caption:
+        return caption, (None if not entities else entities)
+
     new_caption = caption.replace(placeholder, replacement)
-    return new_caption, adjusted_entities
+
+    if not entities:
+        return new_caption, None
+
+    if placeholder not in caption:
+        return caption, entities
+
+    # Occurrences of placeholder as (start_u16, end_u16)
+    occ = []
+    idx = 0
+    while True:
+        i = caption.find(placeholder, idx)
+        if i == -1:
+            break
+        start_u = _u16(caption[:i])
+        occ.append((start_u, start_u + _u16(placeholder)))
+        idx = i + len(placeholder)
+
+    rep_len = _u16(replacement)
+    ph_len = _u16(placeholder)
+    diff = rep_len - ph_len
+
+    def map_pos(pos, is_end):
+        shift = 0
+        for k, (a, b) in enumerate(occ):
+            if pos >= b:
+                shift += diff
+            elif pos > a:
+                # inside a placeholder
+                new_a = a + k * diff
+                return new_a + rep_len if is_end else new_a
+            else:
+                break
+        return pos + shift
+
+    adjusted = []
+    for entity in entities:
+        d = _entity_to_dict(entity)
+        old_start = d["offset"]
+        old_end = old_start + d["length"]
+        new_start = map_pos(old_start, False)
+        new_end = map_pos(old_end, True)
+        length = new_end - new_start
+        if length <= 0:
+            continue
+        d["offset"] = new_start
+        d["length"] = length
+        adjusted.append(d)
+
+    return new_caption, adjusted
+
+# ==================== CHANNEL AUTO-DETECT (from file name) ====================
+_TITLE_CUT_RE = re.compile(
+    r'(?ix)'
+    r'(?:[\s._\-]+|^)'
+    r'(?:S\d{1,2}[\s._\-]*E\d{1,4}'          # S01E05
+    r'|E\d{1,4}(?![a-z])'                      # E05
+    r'|Ep\.?[\s._\-]*\d{1,4}'                 # Ep05
+    r'|Episode[\s._\-]*\d{1,4}'               # Episode 5
+    r'|\d{1,4}[\s._]*(?:480p|720p|1080p|2160p)' # 05 720p
+    r'|480p|720p|1080p|2160p|4k|hdrip|144fps)'
+)
+_DASH_EP_RE = re.compile(r'\s-\s*\d{1,4}(?:\s|\.|$)')
+_TAGS_RE = re.compile(r'\[[^\]]*\]|\([^)]*\)')
+
+def _norm(text):
+    text = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return "".join(ch for ch in text if ch.isalnum())
+
+def extract_title_from_filename(filename):
+    """'[Grp] Solo.Leveling.S01E05.720p.mkv' -> 'Solo Leveling'"""
+    name = os.path.basename(filename or "")
+    base, ext = os.path.splitext(name)
+    if ext and len(ext) <= 5:
+        name = base
+    name = _TAGS_RE.sub(" ", name)
+    name = name.replace("_", " ").replace(".", " ")
+    name = re.sub(r"\s+", " ", name).strip()
+    m = _DASH_EP_RE.search(name)
+    if m:
+        name = name[:m.start()]
+    m = _TITLE_CUT_RE.search(name)
+    if m:
+        name = name[:m.start()]
+    return name.strip(" -._")
+
+def detect_channel_from_filename(filename):
+    """
+    Match a file name against saved channel titles.
+    Returns (status, channel_doc, candidates)
+      status: "found" | "ambiguous" | "none"
+    """
+    title_part = extract_title_from_filename(filename)
+    tp = _norm(title_part)
+
+    name = os.path.basename(filename or "")
+    base, ext = os.path.splitext(name)
+    file_norm = _norm(base if ext and len(ext) <= 5 else name)
+
+    scored = []
+    for ch in channels.find():
+        nt = _norm(ch.get("title", ""))
+        if len(nt) < 3:
+            continue
+        score = 0
+        if tp and nt == tp:
+            score = 2000 + len(nt)
+        elif nt in file_norm:
+            score = 1000 + len(nt)
+        elif len(tp) >= 4 and tp in nt:
+            score = 500 + len(tp)
+        elif tp:
+            ratio = difflib.SequenceMatcher(None, tp, nt).ratio()
+            if ratio >= 0.88:
+                score = int(ratio * 100)
+        if score:
+            scored.append((score, ch))
+
+    if not scored:
+        return "none", None, []
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = scored[0][0]
+    best = [ch for sc, ch in scored if sc == top]
+    if len(best) == 1:
+        return "found", best[0], best
+    return "ambiguous", None, best
+
+# ==================== CHANNEL SETUP (format + update format) ====================
+# A newly added channel is "in setup" (setup_done=False) until BOTH its
+# format and its update format are saved. Old channels (no setup_done field)
+# keep working exactly as before.
+def channel_setup_state(channel_id):
+    """Returns (has_format, has_update_format)."""
+    has_fmt = bool(formats.find_one({"_id": channel_id}))
+    cfg = update_settings.find_one({"_id": "global"}) or {}
+    tpl = (cfg.get("update_channel_formats") or {}).get(channel_id)
+    has_upd = bool(isinstance(tpl, dict) and tpl.get("caption"))
+    return has_fmt, has_upd
+
+def channel_ready(channel_id):
+    """True if the channel may be used for posting."""
+    ch = channels.find_one({"_id": channel_id})
+    if not ch:
+        return False
+    if ch.get("setup_done") is False:
+        return False
+    return bool(formats.find_one({"_id": channel_id}))
+
+def sync_channel_setup(channel_id):
+    """Mark channel as set once both formats exist. Returns (has_fmt, has_upd, done)."""
+    has_fmt, has_upd = channel_setup_state(channel_id)
+    done = has_fmt and has_upd
+    if done:
+        channels.update_one({"_id": channel_id}, {"$set": {"setup_done": True}})
+    return has_fmt, has_upd, done
+
+def build_setup_buttons(channel_id):
+    has_fmt, has_upd = channel_setup_state(channel_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(("✅ " if has_fmt else "📸 ") + "Set Format", callback_data=f"setfmt:{channel_id}:0")],
+        [InlineKeyboardButton(("✅ " if has_upd else "📝 ") + "Set Update Format", callback_data=f"updatefmt:{channel_id}:0")],
+        [InlineKeyboardButton("🔙 Back to Settings", callback_data="menu:settings")]
+    ])
+
+def build_setup_text(channel_id, header="📡 *Channel Setup*"):
+    ch = channels.find_one({"_id": channel_id}) or {}
+    title = escape_md(ch.get("title", channel_id))
+    has_fmt, has_upd = channel_setup_state(channel_id)
+    return (
+        f"{header}\n\n"
+        f"*Channel:* {title}\n"
+        f"*ID:* `{channel_id}`\n\n"
+        f"{'✅' if has_fmt else '❌'} Format\n"
+        f"{'✅' if has_upd else '❌'} Update Format\n\n"
+        f"The channel becomes active only after *both* are set."
+    )
 
 # ==================== CHANNEL KEYBOARD ====================
 def channel_keyboard(page=0, prefix="post"):
@@ -230,7 +413,7 @@ def channel_keyboard(page=0, prefix="post"):
     for ch in page_data:
         title = ch.get("title", ch["_id"])
         
-        if ch.get("has_format"):
+        if ch.get("setup_done", ch.get("has_format")):
             display = f"✅ {title}"
         else:
             display = f"❌ {title}"

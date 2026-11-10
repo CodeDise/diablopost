@@ -27,6 +27,10 @@ from plugins.helpers import (
     adjust_caption_entities,
     build_main_menu_buttons,
     build_menu_text,
+    escape_md,
+    channel_keyboard,
+    detect_channel_from_filename,
+    channel_ready,
 )
 from db import channels, formats, posts, menu_messages
 from config import FILESTORE_CHANNEL_ID, FILESTORE_BOT_USERNAME
@@ -120,6 +124,12 @@ def build_collector_text(collector):
 
     ep_display = f"`{episode}`" if episode else "❓ *Not detected yet*"
 
+    if collector.get("channel"):
+        tag = " _(auto)_" if collector.get("auto_channel") else ""
+        channel_line = f"📺 *Channel:* {escape_md(collector.get('channel_title') or collector['channel'])}{tag}\n"
+    else:
+        channel_line = "🔍 *Channel:* auto-detect from file name\n"
+
     # Build quality grid line
     grid_parts = []
     for q in QUALITY_GRID_ORDER:
@@ -151,6 +161,7 @@ def build_collector_text(collector):
     text = (
         f"📦 *Smart Collector* — {mode_label}\n"
         f"{'─' * 30}\n"
+        f"{channel_line}"
         f"🎬 *Episode:* {ep_display}\n\n"
         f"{grid_line}\n\n"
         f"*Collected:* {count} qualit{'y' if count == 1 else 'ies'}"
@@ -214,6 +225,20 @@ async def delete_collector_panel(context, chat_id):
         logger.warning(f"Could not delete collector panel: {e}")
 
 
+async def ensure_collector_panel(context, chat_id, collector):
+    """Create the live panel if it doesn't exist yet (auto-detect mode)."""
+    if context.user_data.get("collector_msg_id"):
+        await update_collector_panel(context, chat_id, collector)
+        return
+    panel_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=build_collector_text(collector),
+        reply_markup=build_collector_buttons(),
+        parse_mode="Markdown"
+    )
+    context.user_data["collector_msg_id"] = panel_msg.message_id
+
+
 # ==================== COLLECTOR STATE HELPERS ====================
 
 def get_collector(context):
@@ -221,13 +246,22 @@ def get_collector(context):
     return context.user_data.get("collector")
 
 
-def init_collector(context, channel_id):
-    """Initialize fresh collector state"""
+def init_collector(context, channel_id=None):
+    """
+    Initialize fresh collector state.
+    channel_id=None  -> AUTO mode: channel is detected from the first file name.
+    """
+    title = None
+    if channel_id:
+        ch = channels.find_one({"_id": channel_id})
+        title = ch.get("title", channel_id) if ch else channel_id
     context.user_data["collector"] = {
         "mode": None,
         "episode": None,
         "qualities": {},
         "channel": channel_id,
+        "channel_title": title,
+        "auto_channel": False,
         "preview_triggered": False,   # guard: prevent duplicate auto-preview
     }
     return context.user_data["collector"]
@@ -256,13 +290,9 @@ async def enter_collector(update, context):
     # Update MongoDB session step
     update_session(user_id, {"step": "collector"})
 
-    ch = channels.find_one({"_id": channel_id})
-    channel_title = ch.get("title", channel_id) if ch else channel_id
-
-    # Send the ONE persistent collector panel
+    # Send the ONE persistent collector panel (channel line is part of the panel text)
     panel_msg = await query.message.reply_text(
-        f"📺 *Channel:* {channel_title}\n\n"
-        + build_collector_text(collector),
+        build_collector_text(collector),
         reply_markup=build_collector_buttons(),
         parse_mode="Markdown"
     )
@@ -310,6 +340,19 @@ async def smart_collect_input(update, context):
             )
             return
 
+        if not collector.get("channel"):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "⚠️ *Channel not selected*\n\n"
+                    "Link mode cannot auto-detect the channel.\n"
+                    "Please select the channel manually:"
+                ),
+                reply_markup=channel_keyboard(0, "post"),
+                parse_mode="Markdown"
+            )
+            return
+
         collector["mode"] = "link"
         await handle_link_paste(update, context, text=text)
     else:
@@ -343,7 +386,8 @@ async def handle_file_upload(update, context):
     collector = get_collector(context)
 
     if not collector:
-        return
+        # bot restarted / memory lost but Mongo session still alive -> rebuild
+        collector = init_collector(context, s.get("channel"))
 
     # Mode lock check
     if collector["mode"] == "link":
@@ -358,8 +402,6 @@ async def handle_file_upload(update, context):
             parse_mode="Markdown"
         )
         return
-
-    collector["mode"] = "file"
 
     # ---- Get file info ----
     if update.message.video:
@@ -424,6 +466,78 @@ async def handle_file_upload(update, context):
         )
         return
 
+    # ---- AUTO-DETECT CHANNEL (from file name == channel title) ----
+    if not collector.get("channel"):
+        status, ch_doc, candidates = detect_channel_from_filename(file_name)
+
+        if status != "found":
+            if status == "ambiguous":
+                names = "\n".join(f"• {escape_md(c.get('title', c['_id']))}" for c in candidates[:8])
+                reason = f"Multiple channels match this file name:\n{names}"
+            else:
+                reason = "No channel title matches this file name."
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"⚠️ *Channel not detected*\n\n"
+                    f"File: `{file_name}`\n"
+                    f"{reason}\n\n"
+                    f"Rename the file so it contains the channel title, "
+                    f"or select the channel manually:"
+                ),
+                reply_markup=channel_keyboard(0, "post"),
+                parse_mode="Markdown"
+            )
+            return
+
+        if not channel_ready(ch_doc["_id"]):
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"❌ *Channel setup incomplete*\n\n"
+                    f"Detected channel: *{escape_md(ch_doc.get('title', ch_doc['_id']))}*\n"
+                    f"Set both *Format* and *Update Format* first (Settings → Set Channel)."
+                ),
+                parse_mode="Markdown"
+            )
+            return
+
+        collector["channel"] = ch_doc["_id"]
+        collector["channel_title"] = ch_doc.get("title", ch_doc["_id"])
+        collector["auto_channel"] = True
+        update_session(user_id, {"channel": ch_doc["_id"]})
+        logger.info(f"Channel auto-detected: {ch_doc['_id']} ({collector['channel_title']}) from '{file_name}'")
+
+        # collapse the channel-list message (if any) into a short note
+        list_msg = context.user_data.pop("channel_list_msg", None)
+        if list_msg:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=list_msg[0],
+                    message_id=list_msg[1],
+                    text=f"✅ *Channel auto-detected:* {escape_md(collector['channel_title'])}",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+
+    elif collector.get("auto_channel"):
+        # later files must belong to the same channel
+        status, ch_doc, _ = detect_channel_from_filename(file_name)
+        if status == "found" and ch_doc["_id"] != collector["channel"]:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    f"❌ *Channel Mismatch!*\n\n"
+                    f"Current: `{collector.get('channel_title')}`\n"
+                    f"This file: `{ch_doc.get('title', ch_doc['_id'])}`\n\n"
+                    f"All files must be for the same channel.\n"
+                    f"File rejected."
+                ),
+                parse_mode="Markdown"
+            )
+            return
+
     # ---- Detect Episode ----
     episode = _extract_episode(file_name)
 
@@ -443,13 +557,15 @@ async def handle_file_upload(update, context):
             return
         collector["episode"] = episode
 
+    collector["mode"] = "file"
+
     # ---- PHASE 1: Mark quality as "pending" with a placeholder link ----
     # Store immediately so UI updates right away.
     # The placeholder will be replaced by the real link in Phase 2.
     collector["qualities"][quality] = "__pending__"
 
     # ---- IMMEDIATE UI UPDATE (Phase 1) ----
-    await update_collector_panel(context, user_id, collector)
+    await ensure_collector_panel(context, user_id, collector)
 
     # ---- PHASE 2: Background — copy file and generate real link ----
     # Capture everything needed before handing off to the task

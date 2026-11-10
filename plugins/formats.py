@@ -11,7 +11,10 @@ from plugins.helpers import (
     clean_session,
     channel_keyboard,
     validate_format_caption,
-    show_menu_safe
+    show_menu_safe,
+    sync_channel_setup,
+    build_setup_buttons,
+    build_setup_text
 )
 from db import formats, channels
 from config import DB_CHANNEL_ID
@@ -176,6 +179,17 @@ async def receive_format(update, context):
         
         ch = channels.find_one({"_id": channel_id})
         channel_title = ch.get("title", channel_id) if ch else channel_id
+
+        # New channel still in setup and update format missing -> show both buttons
+        _fmt_ok, _upd_ok, _done = sync_channel_setup(channel_id)
+        if ch and ch.get("setup_done") is False and not _done:
+            await update.message.reply_text(
+                build_setup_text(channel_id, "✅ *Format Saved!*"),
+                reply_markup=build_setup_buttons(channel_id),
+                parse_mode="Markdown"
+            )
+            logger.info(f"Format saved for channel {channel_id} (update format pending)")
+            return
         
         await update.message.reply_text(
             f"✅ *Format Saved Successfully!*\n\n"

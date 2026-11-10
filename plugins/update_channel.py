@@ -10,7 +10,11 @@ from plugins.helpers import (
     get_session,
     clean_session,
     show_menu_safe,
-    channel_keyboard
+    channel_keyboard,
+    escape_md,
+    sync_channel_setup,
+    build_setup_buttons,
+    build_setup_text
 )
 from db import update_settings, update_channel_prefs, channels
 import logging
@@ -120,7 +124,7 @@ async def select_update_format_channel(update, context):
 
     current_text = "\n\n*Current template:*\n_Not set_"
     if isinstance(current, dict) and current.get("caption"):
-        current_text = f"\n\n*Current template:*\n`{current['caption']}`"
+        current_text = f"\n\n*Current template:*\n`{current['caption'].replace(chr(96), chr(39))}`"
 
     update_session(query.from_user.id, {
         "step": "update_channel_format",
@@ -128,7 +132,7 @@ async def select_update_format_channel(update, context):
     })
 
     await query.message.reply_text(
-        f"📝 *Set Update Format For:* {channel_title}\n\n"
+        f"📝 *Set Update Format For:* {escape_md(channel_title)}\n\n"
         "Send caption template for update channel post.\n"
         "Template must contain `{episode}`.\n\n"
         "✅ Text formatting will be preserved (bold/italic/mono).\n\n"
@@ -283,7 +287,7 @@ async def receive_update_channel_format(update, context):
         channel_title = ch.get("title", source_channel_id) if ch else source_channel_id
 
         await update.message.reply_text(
-            f"✅ Custom update format removed for *{channel_title}*.\n"
+            f"✅ Custom update format removed for *{escape_md(channel_title)}*.\n"
             "Now redirect caption will use source post caption.",
             parse_mode="Markdown"
         )
@@ -328,9 +332,32 @@ async def receive_update_channel_format(update, context):
     ch = channels.find_one({"_id": source_channel_id})
     channel_title = ch.get("title", source_channel_id) if ch else source_channel_id
 
+    # New channel still in setup -> continue the 2-step setup
+    if ch and ch.get("setup_done") is False:
+        _fmt_ok, _upd_ok, _done = sync_channel_setup(source_channel_id)
+        if _done:
+            await update.message.reply_text(
+                f"🎉 *Channel Set Successfully!*\n\n"
+                f"*Channel:* {escape_md(channel_title)}\n"
+                f"✅ Format\n✅ Update Format\n\n"
+                f"This channel is now ready for posting.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ Add Next Channel", callback_data="addnext")],
+                    [InlineKeyboardButton("✅ Done", callback_data="cancelafter")]
+                ]),
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                build_setup_text(source_channel_id, "✅ *Update Format Saved!*"),
+                reply_markup=build_setup_buttons(source_channel_id),
+                parse_mode="Markdown"
+            )
+        return
+
     await update.message.reply_text(
-        f"✅ Update channel format saved for *{channel_title}*.\n\n"
-        f"*Template:* `{text}`\n\n"
+        f"✅ Update channel format saved for *{escape_md(channel_title)}*.\n\n"
+        f"*Template:* `{text.replace(chr(96), chr(39))}`\n\n"
         "Redirect posts will replace `{episode}` automatically and keep text formatting.",
         parse_mode="Markdown"
     )

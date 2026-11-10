@@ -39,12 +39,28 @@ async def show_channel_list(update, context):
         await query.answer("⛔ Unauthorized", show_alert=True)
         return
     
-    clean_session(query.from_user.id)
+    user_id = query.from_user.id
+    clean_session(user_id)
+
+    # AUTO MODE: upload the episode file(s) directly -> channel is detected
+    # from the file name (channel title == video title). Manual selection
+    # from the list below still works as a fallback.
+    update_session(user_id, {
+        "step": "collector",
+        "channel": None,
+        "notify": True
+    })
+    from plugins.smart_collector import init_collector
+    init_collector(context, None)
+    context.user_data.pop("collector_msg_id", None)
+    context.user_data["channel_list_msg"] = (query.message.chat_id, query.message.message_id)
     
     try:
         await query.message.edit_text(
             "📺 *ᴄʀᴇᴀᴛᴇ ᴘᴏsᴛ*\n\n"
-            "sᴇʟᴇᴄᴛ ᴀ ᴄʜᴀɴɴᴇʟ ᴛᴏ ᴘᴜʙʟɪsʜ ᴛʜᴇ ᴇᴘɪsᴏᴅᴇ:\n"
+            "📤 *Send the episode file(s) now* — the channel is "
+            "auto-detected from the file name (channel title).\n\n"
+            "Or select a channel manually:\n"
             "✅ ʀᴇᴀᴅʏ ᴛᴏ ᴘᴏsᴛ\n"
             "❌ ғᴏʀᴍᴀᴛ ɴᴏᴛ sᴇᴛ",
             reply_markup=channel_keyboard(0, "post"),
@@ -60,11 +76,12 @@ async def select_channel(update, context):
     parts = query.data.split(":")
     channel_id = parts[1]
     
+    from plugins.helpers import channel_ready
     fmt = formats.find_one({"_id": channel_id})
-    if not fmt:
+    if not fmt or not channel_ready(channel_id):
         await query.answer(
-            "❌ ɴᴏ ꜰᴏʀᴍᴀᴛ ꜱᴇᴛ ꜰᴏʀ ᴛʜɪꜱ ᴄʜᴀɴɴᴇʟ!\n"
-            "ꜱᴇᴛ ꜰᴏʀᴍᴀᴛ ꜰɪʀꜱᴛ: ꜱᴇᴛᴛɪɴɢꜱ → ꜱᴇᴛ ꜰᴏʀᴍᴀᴛ",
+            "❌ ᴄʜᴀɴɴᴇʟ sᴇᴛᴜᴘ ɪɴᴄᴏᴍᴘʟᴇᴛᴇ!\n"
+            "sᴇᴛ ʙᴏᴛʜ: ꜰᴏʀᴍᴀᴛ + ᴜᴘᴅᴀᴛᴇ ꜰᴏʀᴍᴀᴛ",
             show_alert=True
         )
         return
@@ -449,7 +466,14 @@ async def send_post(update, context):
                     logger.info(f"✅ Redirect post sent to update channel: {update_channel_id}")
         
         except Exception as e:
-            logger.error(f"⚠️ Update channel send failed (non-critical): {e}")
+            logger.error(f"⚠️ Update channel send failed (non-critical): {e}", exc_info=True)
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"⚠️ Update channel post failed (main post was sent):\n{str(e)[:300]}"
+                )
+            except Exception:
+                pass
         
         # ========== FIX BUG #2: FOLLOW-UPS ==========
         # Always run follow-ups after a successful post send.
